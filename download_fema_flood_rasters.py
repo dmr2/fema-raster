@@ -559,6 +559,7 @@ def rasterize_state(
         crs=output_crs,
         transform=transform,
         compress="LZW",
+        BIGTIFF="IF_SAFER",
         blocksize=512,
         overview_resampling="NEAREST",
         nodata=0,
