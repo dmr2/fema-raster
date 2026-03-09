@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+
+# Generated outputs
+output*/
+
+# Logs and local artifacts
+*.log
