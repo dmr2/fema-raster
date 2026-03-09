@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import random
 import sys
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +80,7 @@ FLD_ZONE_TO_CODE: Dict[str, int] = {
 class StateInfo:
     abbr: str
     name: str
+    fips: str
     geometry: object
 
 
@@ -165,6 +169,30 @@ def request_json(
     raise RuntimeError(f"Request failed after {max_retries + 1} attempts: {last_exc}")
 
 
+def request_response(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+    max_retries: int,
+    backoff_seconds: float,
+    params: Optional[Dict[str, object]] = None,
+    stream: bool = False,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.get(url, params=params, timeout=timeout, stream=stream)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                break
+            sleep_for = backoff_seconds * (2**attempt) + random.uniform(0, 0.25)
+            time.sleep(sleep_for)
+    raise RuntimeError(f"Request failed after {max_retries + 1} attempts: {last_exc}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download and rasterize FEMA NFHL data by state")
     parser.add_argument(
@@ -177,6 +205,12 @@ def parse_args() -> argparse.Namespace:
         choices=["states", "states+territories"],
         default="states+territories",
         help="Scope used when --states is omitted (default: states+territories)",
+    )
+    parser.add_argument(
+        "--source-mode",
+        choices=["hybrid", "state-package", "rest"],
+        default="hybrid",
+        help="FEMA source mode: hybrid (state package first, REST fallback), state-package, or rest.",
     )
     parser.add_argument(
         "--output-dir",
@@ -286,11 +320,109 @@ def load_states(selected_states: Optional[Sequence[str]], scope: str) -> List[St
         StateInfo(
             abbr=row["STUSPS"],
             name=row["NAME"],
+            fips=str(row["STATEFP"]).zfill(2),
             geometry=row.geometry,
         )
         for _, row in gdf.iterrows()
     ]
     return states
+
+
+def normalize_fema_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    fields = ["FLD_ZONE", "ZONE_SUBTY", "SFHA_TF", "STATIC_BFE"]
+    if gdf.crs is None:
+        # FEMA NFHL source layers are generally NAD83 geographic if CRS is missing.
+        gdf = gdf.set_crs("EPSG:4269", allow_override=True)
+    gdf = gdf.to_crs("EPSG:4326")
+    for col in fields:
+        if col not in gdf.columns:
+            gdf[col] = None
+    return gdf[fields + ["geometry"]].copy()
+
+
+def fetch_fema_features_from_state_package(
+    state: StateInfo,
+    session: requests.Session,
+    timeout: int,
+    max_retries: int,
+    backoff_seconds: float,
+) -> gpd.GeoDataFrame:
+    search_url = (
+        "https://msc.fema.gov/portal/advanceSearch"
+        f"?affiliate=fema&query&selstate={state.fips}&selcounty={state.fips}001"
+        f"&selcommunity={state.fips}001C&searchedCid={state.fips}001C&method=search"
+    )
+    response = request_response(
+        session=session,
+        url=search_url,
+        timeout=timeout,
+        max_retries=max_retries,
+        backoff_seconds=backoff_seconds,
+    )
+    try:
+        search_payload = response.json()
+    except ValueError:
+        search_payload = json.loads(response.text)
+
+    product_path = (
+        search_payload.get("EFFECTIVE", {})
+        .get("NFHL_STATE_DATA", [{}])[0]
+        .get("product_FILE_PATH")
+    )
+    if not product_path:
+        raise RuntimeError(f"No state package product path found for {state.abbr}")
+
+    package_url = f"https://hazards.fema.gov/nfhlv2/output/State/{product_path}"
+    package_response = request_response(
+        session=session,
+        url=package_url,
+        timeout=timeout,
+        max_retries=max_retries,
+        backoff_seconds=backoff_seconds,
+    )
+
+    with tempfile.TemporaryDirectory(prefix=f"fema_{state.abbr}_") as tmpdir:
+        with zipfile.ZipFile(io.BytesIO(package_response.content)) as zf:
+            zf.extractall(tmpdir)
+
+        root = Path(tmpdir)
+
+        # Prefer geodatabase layer for fidelity.
+        for gdb_path in root.rglob("*.gdb"):
+            # First try pyogrio (more reliable for OpenFileGDB in many envs).
+            try:
+                import pyogrio
+                layer_rows = pyogrio.list_layers(gdb_path)
+                layer_names = [str(row[0]) for row in layer_rows]
+                target = next((ly for ly in layer_names if ly.lower() == "s_fld_haz_ar"), None)
+                if target is None:
+                    target = next((ly for ly in layer_names if "fld_haz_ar" in ly.lower()), None)
+                if target:
+                    gdf = gpd.read_file(gdb_path, layer=target, engine="pyogrio")
+                    return normalize_fema_gdf(gdf)
+            except Exception:
+                pass
+
+            # Fallback to fiona if pyogrio route fails.
+            try:
+                import fiona
+                layers = fiona.listlayers(gdb_path)
+                target = next((ly for ly in layers if ly.lower() == "s_fld_haz_ar"), None)
+                if target is None:
+                    target = next((ly for ly in layers if "fld_haz_ar" in ly.lower()), None)
+                if target:
+                    gdf = gpd.read_file(gdb_path, layer=target)
+                    return normalize_fema_gdf(gdf)
+            except Exception:
+                continue
+
+        # Fallback to shapefile if no readable GDB layer.
+        for shp_path in root.rglob("*.shp"):
+            if shp_path.name.lower() == "s_fld_haz_ar.shp" or "fld_haz_ar" in shp_path.name.lower():
+                gdf = gpd.read_file(shp_path)
+                return normalize_fema_gdf(gdf)
+
+    raise RuntimeError(f"Could not find S_Fld_Haz_Ar in FEMA package for {state.abbr}")
 
 
 def fetch_fema_features_for_state(
@@ -675,15 +807,45 @@ def main() -> int:
             continue
 
         try:
-            gdf = fetch_fema_features_for_state(
-                state=state,
-                session=session,
-                timeout=args.timeout,
-                max_record_count=args.max_record_count,
-                sleep_seconds=args.sleep_seconds,
-                max_retries=args.max_retries,
-                backoff_seconds=args.backoff_seconds,
-            )
+            if args.source_mode == "state-package":
+                gdf = fetch_fema_features_from_state_package(
+                    state=state,
+                    session=session,
+                    timeout=args.timeout,
+                    max_retries=args.max_retries,
+                    backoff_seconds=args.backoff_seconds,
+                )
+            elif args.source_mode == "rest":
+                gdf = fetch_fema_features_for_state(
+                    state=state,
+                    session=session,
+                    timeout=args.timeout,
+                    max_record_count=args.max_record_count,
+                    sleep_seconds=args.sleep_seconds,
+                    max_retries=args.max_retries,
+                    backoff_seconds=args.backoff_seconds,
+                )
+            else:
+                try:
+                    print("  Source: FEMA state package")
+                    gdf = fetch_fema_features_from_state_package(
+                        state=state,
+                        session=session,
+                        timeout=args.timeout,
+                        max_retries=args.max_retries,
+                        backoff_seconds=args.backoff_seconds,
+                    )
+                except Exception as package_exc:
+                    print(f"  State package failed; falling back to REST ({package_exc})", file=sys.stderr)
+                    gdf = fetch_fema_features_for_state(
+                        state=state,
+                        session=session,
+                        timeout=args.timeout,
+                        max_record_count=args.max_record_count,
+                        sleep_seconds=args.sleep_seconds,
+                        max_retries=args.max_retries,
+                        backoff_seconds=args.backoff_seconds,
+                    )
 
             if gdf.empty:
                 print(f"  No FEMA flood features found for {state.abbr}; skipping raster")

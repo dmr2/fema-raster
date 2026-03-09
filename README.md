@@ -48,6 +48,7 @@ python download_fema_flood_rasters.py --scope states+territories --resolution 10
 
 - `--states`: list of state abbreviations (omit for all)
 - `--scope`: when `--states` is omitted, use `states` or `states+territories` (default)
+- `--source-mode`: `hybrid` (default), `state-package`, or `rest`
 - `--crs`: output raster CRS (default `EPSG:3857`)
 - `--resolution`: output raster pixel size in output CRS units (default `10`)
 - `--save-vector`: also save state GeoJSON polygons
@@ -76,6 +77,12 @@ Example with water mask clipping:
 
 ```bash
 python download_fema_flood_rasters.py --states RI --resolution 3 --output-dir output_3m --water-mask /path/to/water_mask.tif
+```
+
+Example using FEMA state packages first (with REST fallback):
+
+```bash
+python download_fema_flood_rasters.py --states RI --source-mode hybrid --output-dir output_hybrid
 ```
 
 ## Customize class digits
