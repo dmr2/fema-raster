@@ -60,6 +60,8 @@ python download_fema_flood_rasters.py --scope states+territories --resolution 10
 - `--dry-run`: validate configuration and selected states without downloading data
 - `--max-retries`: request retries for FEMA/API calls (default `5`)
 - `--backoff-seconds`: exponential backoff base seconds for retries (default `1.0`)
+- `--memory-mode`: `auto` (default), `array`, or `memmap` for raster working arrays
+- `--chunk-rows`: processing chunk size for mask/write/stats (default `2048`)
 
 Run outputs include:
 

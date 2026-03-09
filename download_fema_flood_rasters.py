@@ -29,6 +29,7 @@ import rasterio
 from rasterio.features import rasterize
 from rasterio.transform import array_bounds, from_origin
 from rasterio.warp import Resampling, reproject, transform_bounds
+from rasterio.windows import Window, bounds as window_bounds, transform as window_transform
 
 # FEMA NFHL service layer for flood hazard polygons.
 # Service root: https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer
@@ -142,6 +143,18 @@ def write_state_stats_json(output_path: Path, raster: np.ndarray) -> None:
         "total_pixels": total,
         "class_pixel_counts": {str(int(v)): int(c) for v, c in zip(vals, counts)},
         "class_pixel_percent": {str(int(v)): round((int(c) / total) * 100.0, 6) for v, c in zip(vals, counts)},
+    }
+    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_state_stats_json_from_counts(output_path: Path, counts: Dict[int, int], total_pixels: int) -> None:
+    payload = {
+        "total_pixels": int(total_pixels),
+        "class_pixel_counts": {str(int(k)): int(v) for k, v in sorted(counts.items())},
+        "class_pixel_percent": {
+            str(int(k)): round((int(v) / total_pixels) * 100.0, 6) if total_pixels else 0.0
+            for k, v in sorted(counts.items())
+        },
     }
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -293,6 +306,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Base retry backoff seconds; exponential with jitter (default 1.0).",
+    )
+    parser.add_argument(
+        "--memory-mode",
+        choices=["auto", "array", "memmap"],
+        default="auto",
+        help="Raster working array mode (default: auto).",
+    )
+    parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=2048,
+        help="Rows per processing chunk for mask/write operations (default 2048).",
     )
     return parser.parse_args()
 
@@ -611,6 +636,96 @@ def build_water_mask_array(
     return mask.astype(bool)
 
 
+def apply_water_mask_in_place(
+    raster_arr: np.ndarray,
+    water_mask_path: Path,
+    out_transform,
+    out_crs: str,
+    chunk_rows: int,
+) -> None:
+    height, width = raster_arr.shape
+    suffix = water_mask_path.suffix.lower()
+
+    if suffix in {".tif", ".tiff"}:
+        with rasterio.open(water_mask_path) as src:
+            if src.crs is None:
+                raise ValueError(f"Water mask raster has no CRS: {water_mask_path}")
+            src_nodata = src.nodata
+            fill_value = src_nodata if src_nodata is not None else 0
+
+            for row_start in range(0, height, chunk_rows):
+                row_count = min(chunk_rows, height - row_start)
+                dst_win = Window(0, row_start, width, row_count)
+                dst_tr = window_transform(dst_win, out_transform)
+                b = window_bounds(dst_win, out_transform)
+                src_bounds = transform_bounds(out_crs, src.crs, *b, densify_pts=21)
+                src_win = rasterio.windows.from_bounds(*src_bounds, transform=src.transform)
+                src_win = src_win.round_offsets().round_lengths()
+
+                src_arr = src.read(1, window=src_win, boundless=True, fill_value=fill_value)
+                src_valid = np.ones(src_arr.shape, dtype=bool)
+                if src_nodata is not None:
+                    src_valid = src_arr != src_nodata
+                src_water = ((src_arr != 0) & src_valid).astype(np.uint8)
+
+                dst_water = np.zeros((row_count, width), dtype=np.uint8)
+                reproject(
+                    source=src_water,
+                    destination=dst_water,
+                    src_transform=src.window_transform(src_win),
+                    src_crs=src.crs,
+                    dst_transform=dst_tr,
+                    dst_crs=out_crs,
+                    resampling=Resampling.nearest,
+                )
+                chunk = raster_arr[row_start : row_start + row_count, :]
+                chunk[dst_water.astype(bool)] = 0
+        return
+
+    # Vector masks: rasterize once into lightweight uint8 memmap and apply.
+    with tempfile.TemporaryDirectory(prefix="water_mask_") as tmpdir:
+        mask_path = Path(tmpdir) / "mask_uint8.bin"
+        mask = np.memmap(mask_path, mode="w+", dtype=np.uint8, shape=(height, width))
+        mask[:] = 0
+
+        water_gdf = gpd.read_file(water_mask_path)
+        if water_gdf.empty:
+            return
+        if water_gdf.crs is None:
+            raise ValueError(f"Water mask vector has no CRS: {water_mask_path}")
+        water_proj = water_gdf.to_crs(out_crs)
+        shapes = ((geom, 1) for geom in water_proj.geometry if geom is not None and not geom.is_empty)
+        rasterize(
+            shapes=shapes,
+            out=mask,
+            transform=out_transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=False,
+        )
+
+        for row_start in range(0, height, chunk_rows):
+            row_count = min(chunk_rows, height - row_start)
+            chunk = raster_arr[row_start : row_start + row_count, :]
+            chunk_mask = mask[row_start : row_start + row_count, :]
+            chunk[chunk_mask != 0] = 0
+        del mask
+
+
+def compute_class_counts(raster_arr: np.ndarray, chunk_rows: int) -> Tuple[Dict[int, int], int]:
+    height, _ = raster_arr.shape
+    counts: Dict[int, int] = {}
+    total = 0
+    for row_start in range(0, height, chunk_rows):
+        row_count = min(chunk_rows, height - row_start)
+        chunk = np.asarray(raster_arr[row_start : row_start + row_count, :], dtype=np.uint8)
+        total += int(chunk.size)
+        vals, cts = np.unique(chunk, return_counts=True)
+        for v, c in zip(vals.tolist(), cts.tolist()):
+            counts[int(v)] = counts.get(int(v), 0) + int(c)
+    return counts, total
+
+
 def build_shared_grid(states: Sequence[StateInfo], resolution_m: float, out_crs: str) -> RasterGrid:
     state_geoms = gpd.GeoSeries([s.geometry for s in states], crs="EPSG:4326").to_crs(out_crs)
     minx, miny, maxx, maxy = state_geoms.total_bounds
@@ -634,7 +749,9 @@ def rasterize_state(
     output_crs: str,
     water_mask_path: Optional[Path] = None,
     output_grid: Optional[RasterGrid] = None,
-) -> Tuple[int, int, int, np.ndarray]:
+    memory_mode: str = "auto",
+    chunk_rows: int = 2048,
+) -> Tuple[int, int, int, Dict[int, int], int]:
     if gdf_4326.empty:
         raise ValueError(f"No features to rasterize for {state.abbr}")
 
@@ -659,10 +776,25 @@ def rasterize_state(
         height = output_grid.height
         transform = output_grid.transform
 
+    pixel_count = width * height
+    if memory_mode == "auto":
+        use_memmap = pixel_count > 200_000_000
+    else:
+        use_memmap = memory_mode == "memmap"
+
+    raster_tmp_path: Optional[Path] = None
+    if use_memmap:
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"raster_{state.abbr}_"))
+        raster_tmp_path = tmp_dir / "raster_uint8.bin"
+        raster = np.memmap(raster_tmp_path, mode="w+", dtype=np.uint8, shape=(height, width))
+        raster[:] = 0
+    else:
+        raster = np.zeros((height, width), dtype=np.uint8)
+
     shapes = ((geom, val) for geom, val in zip(gdf_proj.geometry, values) if geom is not None and not geom.is_empty)
-    raster = rasterize(
+    rasterize(
         shapes=shapes,
-        out_shape=(height, width),
+        out=raster,
         transform=transform,
         fill=0,
         dtype=np.uint8,
@@ -670,14 +802,13 @@ def rasterize_state(
     )
 
     if water_mask_path is not None:
-        water_mask = build_water_mask_array(
+        apply_water_mask_in_place(
+            raster_arr=raster,
             water_mask_path=water_mask_path,
-            out_height=height,
-            out_width=width,
             out_transform=transform,
             out_crs=output_crs,
+            chunk_rows=chunk_rows,
         )
-        raster[water_mask] = 0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
@@ -696,10 +827,22 @@ def rasterize_state(
         overview_resampling="NEAREST",
         nodata=0,
     ) as dst:
-        dst.write(raster, 1)
+        for row_start in range(0, height, chunk_rows):
+            row_count = min(chunk_rows, height - row_start)
+            win = Window(0, row_start, width, row_count)
+            chunk = np.asarray(raster[row_start : row_start + row_count, :], dtype=np.uint8)
+            dst.write(chunk, 1, window=win)
 
+    class_counts, total_pixels = compute_class_counts(raster, chunk_rows=chunk_rows)
     feature_count = int(len(gdf_proj))
-    return width, height, feature_count, raster
+    if raster_tmp_path is not None:
+        del raster
+        try:
+            raster_tmp_path.unlink(missing_ok=True)
+            raster_tmp_path.parent.rmdir()
+        except Exception:
+            pass
+    return width, height, feature_count, class_counts, total_pixels
 
 
 def write_mapping_json(output_dir: Path) -> None:
@@ -756,6 +899,9 @@ def main() -> int:
         return 1
     if args.backoff_seconds < 0:
         print("--backoff-seconds must be >= 0", file=sys.stderr)
+        return 1
+    if args.chunk_rows <= 0:
+        print("--chunk-rows must be > 0", file=sys.stderr)
         return 1
     water_mask_path = Path(args.water_mask).expanduser().resolve() if args.water_mask else None
     if water_mask_path and not water_mask_path.exists():
@@ -869,7 +1015,7 @@ def main() -> int:
                     gdf.to_file(vec_path, driver="GeoJSON")
                 print(f"  Saved vector: {vec_path}")
 
-            width, height, feature_count, raster = rasterize_state(
+            width, height, feature_count, class_counts, total_pixels = rasterize_state(
                 gdf_4326=gdf,
                 state=state,
                 output_path=tif_path,
@@ -877,9 +1023,11 @@ def main() -> int:
                 output_crs=args.crs,
                 water_mask_path=water_mask_path,
                 output_grid=shared_grid,
+                memory_mode=args.memory_mode,
+                chunk_rows=args.chunk_rows,
             )
             stats_path = state_dir / f"{state.abbr}_fema_flood_stats.json"
-            write_state_stats_json(stats_path, raster)
+            write_state_stats_json_from_counts(stats_path, class_counts, total_pixels)
             print(f"  Rasterized {feature_count} features -> {tif_path} ({width}x{height})")
             append_run_log(
                 run_log_path,
